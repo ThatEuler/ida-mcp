@@ -16,6 +16,7 @@ import ipaddress
 import json
 import math
 import os
+import queue
 import signal
 import sys
 import threading
@@ -958,39 +959,127 @@ def close_database(
     return DATABASE_MANAGER.close_database(instance_id)
 
 
-def _install_server_shutdown_handlers() -> None:
-    def cleanup_and_exit(signum: int, _frame: Any) -> None:
-        _shutdown_server_state()
-        try:
-            mcp.stop()
-        finally:
-            raise SystemExit(128 + signum)
-
-    signal.signal(signal.SIGINT, cleanup_and_exit)
-    signal.signal(signal.SIGTERM, cleanup_and_exit)
-
-
 class _ShutdownOnEOFInput:
-    """Trigger lease cleanup as soon as the stdio peer closes its input."""
+    """Trigger EOF cleanup and allow a pending read to be stopped on shutdown."""
 
     def __init__(self, stream: BinaryIO, on_eof: Callable[[], None]) -> None:
         self._stream = stream
         self._on_eof = on_eof
         self._eof_seen = False
         self._lock = threading.Lock()
+        self._stopped = threading.Event()
+        self._requests: queue.SimpleQueue[int | None] = queue.SimpleQueue()
+        self._responses: queue.SimpleQueue[bytes | Exception] = queue.SimpleQueue()
+        self._reader: threading.Thread | None = None
+
+    def _read(self) -> None:
+        # A pipe read cannot be cancelled portably. Keep it outside asyncio's
+        # executor so interpreter shutdown never has to join a blocked reader.
+        # Use a separate buffer too: a daemon holding sys.stdin's buffer lock
+        # would cause a fatal error when Python closes stdin during finalization.
+        stream = self._stream
+        try:
+            try:
+                descriptor = stream.fileno()
+            except (AttributeError, OSError):
+                pass  # In-memory streams have no descriptor to duplicate.
+            else:
+                stream = os.fdopen(os.dup(descriptor), "rb")
+            # Read only on demand rather than buffering unbounded input ahead.
+            while not self._stopped.is_set():
+                size = self._requests.get()
+                if size is None:
+                    return
+                data = stream.readline(size)
+                self._responses.put(data)
+                if not data:
+                    return
+        except Exception as error:  # noqa: BLE001 -- propagate reader failures
+            self._responses.put(error)
+        finally:
+            if stream is not self._stream:
+                stream.close()
+
+    def stop(self) -> None:
+        self._stopped.set()
+        self._requests.put(None)
+        self._responses.put(b"")
 
     def readline(self, size: int = -1) -> bytes:
-        data = self._stream.readline(size)
-        if data:
-            return data
         with self._lock:
-            if not self._eof_seen:
+            if self._eof_seen or self._stopped.is_set():
+                return b""
+            if self._reader is None:
+                self._reader = threading.Thread(
+                    target=self._read, name="ida-mcp-stdin", daemon=True
+                )
+                self._reader.start()
+            self._requests.put(size)
+            data = self._responses.get()
+            if self._stopped.is_set():
+                return b""
+            if isinstance(data, Exception):
+                raise data
+            if not data:
                 self._eof_seen = True
                 self._on_eof()
-        return data
+            return data
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._stream, name)
+
+
+async def _serve_stdio_async(
+    stdin: _ShutdownOnEOFInput, database: str | None, agent: str | None
+) -> None:
+    loop = asyncio.get_running_loop()
+    server_task = asyncio.current_task()
+    assert server_task is not None
+    stop_signal: int | None = None
+    shutting_down = False
+
+    def cancel_server() -> None:
+        if not shutting_down:
+            server_task.cancel()
+
+    def request_stop(signum: int, _frame: Any) -> None:
+        nonlocal stop_signal
+        if stop_signal is None:
+            stop_signal = signum
+            # Signal handlers can interrupt code holding any of the manager,
+            # trace or transport locks. Do no cleanup (or cancellation) inline.
+            loop.call_soon_threadsafe(cancel_server)
+
+    previous_handlers = {
+        signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
+    }
+    try:
+        for signum in previous_handlers:
+            signal.signal(signum, request_stop)
+        _start_mcp_trace("stdio", agent)
+        if database:
+            DATABASE_MANAGER.schedule_startup_open(database)
+        try:
+            # ZeroMCP's public annotation requires the concrete BinaryIO type.
+            await mcp.stdio_async(stdin=cast(BinaryIO, stdin))
+        except asyncio.CancelledError:
+            if stop_signal is None:
+                raise
+    finally:
+        shutting_down = True
+        stdin.stop()
+        try:
+            # Keep the loop responsive to further signals while leases close.
+            # Once cleanup starts, signals must not cancel or re-enter it.
+            await asyncio.to_thread(_shutdown_server_state)
+        finally:
+            try:
+                mcp.stop()
+            finally:
+                for signum, previous in previous_handlers.items():
+                    signal.signal(signum, previous)
+    if stop_signal is not None:
+        raise SystemExit(128 + stop_signal)
 
 
 def serve_stdio(
@@ -1020,21 +1109,8 @@ def serve_stdio(
     previous_manager.shutdown()
 
     _unset_empty_environment_variables()
-    _install_server_shutdown_handlers()
-    _start_mcp_trace("stdio", agent)
-    if database:
-        DATABASE_MANAGER.schedule_startup_open(database)
-
-    # ZeroMCP only reads from this transparent proxy, but its public annotation
-    # requires the concrete BinaryIO type.
-    stdin = cast(
-        BinaryIO,
-        _ShutdownOnEOFInput(sys.stdin.buffer, _shutdown_server_state),
-    )
-    try:
-        asyncio.run(mcp.stdio_async(stdin=stdin))
-    finally:
-        _shutdown_server_state()
+    stdin = _ShutdownOnEOFInput(sys.stdin.buffer, _shutdown_server_state)
+    asyncio.run(_serve_stdio_async(stdin, database, agent))
 
 
 __all__ = [
